@@ -44,12 +44,18 @@ DEFAULT_DEAD_MESSAGE_TTL = 86400000 * 7
 
 #: The amount of time in milliseconds that has to pass without a
 #: heartbeat for a worker to be considered offline.
-DEFAULT_HEARTBEAT_TIMEOUT = 60000
+#: A worker should check in at least every second.
+DEFAULT_HEARTBEAT_TIMEOUT = 10000
 
 #: A hint for the max lua stack size. The broker discovers this value
 #: the first time it's run, but it may be overwritten using this var.
 DEFAULT_LUA_MAX_STACK = getenv_int("dramatiq_lua_max_stack")
 
+#: Seconds between enforced maintenance intervals
+# Maintenance happens more often when a lot of messages are processed.
+# To ensure maintenance also happens when very few messages are processed, it
+# additionally happens at regular intervals.
+MIN_MAINTENANCE_INTERVAL = 10
 
 class RedisBroker(Broker):
     """A broker than can be used with Redis.
@@ -112,6 +118,7 @@ class RedisBroker(Broker):
         self.namespace = namespace
         self.maintenance_chance = maintenance_chance
         self.heartbeat_timeout = heartbeat_timeout
+        self.last_maintenance_time = time.monotonic() - random.randint(1, MIN_MAINTENANCE_INTERVAL)
         self.dead_message_ttl = dead_message_ttl
         self.queues = set()
         # TODO: Replace usages of StrictRedis (redis-py 2.x) with Redis in Dramatiq 2.0.
@@ -239,10 +246,15 @@ class RedisBroker(Broker):
             time.sleep(interval / 1000)
 
     def _should_do_maintenance(self, command):
-        return int(
+        do_it = (
             command not in MAINTENANCE_COMMAND_BLACKLIST and
             random.randint(1, MAINTENANCE_SCALE) <= self.maintenance_chance
-        )
+        ) or (time.monotonic() > self.last_maintenance_time + MIN_MAINTENANCE_INTERVAL)
+
+        if do_it:
+          self.last_maintenance_time = time.monotonic()
+
+        return int(do_it)
 
     _max_unpack_size_val = None
     _max_unpack_size_mut = Lock()
@@ -360,10 +372,26 @@ class _RedisConsumer(Consumer):
                     # prefetch up to that number of messages.
                     messages = []
                     if self.outstanding_message_count < self.prefetch:
+                        # Block a short time or until messages are in the queue.
+                        # The message is left in the queue as source and destination are
+                        # the same.
+                        self.broker.client.blmove(
+                          f"dramatiq:{self.queue_name}",
+                          f"dramatiq:{self.queue_name}",
+                          1, # 1 second
+                          src='LEFT',
+                          dest='LEFT'
+                        )
+
+                        # Go down the road to keep heartbeats alive
                         self.message_cache = messages = self.broker.do_fetch(
                             self.queue_name,
                             self.prefetch - self.outstanding_message_count,
                         )
+
+                        if not messages:
+                            #
+                            return None
 
                     # Because we didn't get any messages, we should
                     # progressively long poll up to the idle timeout.
