@@ -71,7 +71,9 @@ class RedisBackend(ResultBackend):
 
         message_key = self.build_message_key(message)
         if block:
-            timeout = int(timeout / 1000)
+            # While the typing disagrees, recent versions support a floating point
+            # timeout.
+            timeout = timeout / 1000
             if timeout == 0:
                 data = self.client.rpoplpush(message_key, message_key)
             else:
